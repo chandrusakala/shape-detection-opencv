@@ -1,0 +1,15 @@
+Processing:
+	- Quantization
+	- Filtering
+	- Noise Reduction
+
+Contour detection:
+	- extracts the line segments/curve
+
+Shape Detection:
+	- actually understanding what's in the image
+
+Benchmarking
+	- understand the impact of parameters
+	- time taken
+	- memory consumed

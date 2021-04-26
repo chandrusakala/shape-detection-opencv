@@ -6,9 +6,9 @@ TARGETS = build/shape_detect
 
 all: $(TARGETS)
 
-build/shape_detect: main.cpp
+build/shape_detect: hough_find.cpp
 	-mkdir -p build
-	$(CXX) $(CXXFLAGS) main.cpp $(LIBS) -o build/shape_detect
+	$(CXX) $(CXXFLAGS) hough_find.cpp $(LIBS) -o build/hough_shape_detect
 
 clean:
 	-rm -rf build/
