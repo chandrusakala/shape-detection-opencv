@@ -29,6 +29,71 @@ double angle(const Point a, const Point b, const Point c)
 	return acos(cos_angle);
 }
 
+bool isEllipse(const vector<Point> &contour, double threshold)
+{
+	/*
+	 * Find the bounding rectangle
+	 * Create a point set from the equation of the ellipse
+	 * Translate all the points such that the center of the ellipse is at (0,0) and it is laying horizontal/virtical
+	 * Compare that point set to the original contour
+	 * If they are similar enough, return true
+	 */
+	RotatedRect bound = fitEllipse(contour);
+
+	vector<Point> ellipse_points;
+	Point2f center = bound.center;
+
+	double a_2 = pow(bound.size.width * 0.5, 2);
+	double b_2 = pow(bound.size.height * 0.5, 2);
+	double ellipse_angle = (bound.angle * M_PI) / 180;
+
+	for (size_t i = 0; i < bound.size.width; i++) {
+		double x = -bound.size.width * 0.5 + i;
+		double y_left = sqrt((1 - (x * x / a_2)) * b_2);
+
+		//rotate
+		//[ cos(seta) sin(seta)]
+		//[-sin(seta) cos(seta)]
+		cv::Point2f rotate_point_left;
+		rotate_point_left.x = cos(ellipse_angle) * x - sin(ellipse_angle) * y_left;
+		rotate_point_left.y = sin(ellipse_angle) * x + cos(ellipse_angle) * y_left;
+
+		//trans
+		rotate_point_left += center;
+
+		//store
+		ellipse_points.push_back(Point(rotate_point_left));
+	}
+
+	for (size_t i = 0; i < bound.size.width; i++) {
+		double x = bound.size.width * 0.5 - i;
+		double y_right = -sqrt((1 - (x * x / a_2)) * b_2);
+
+		//rotate
+		//[ cos(seta) sin(seta)]
+		//[-sin(seta) cos(seta)]
+		cv::Point2f rotate_point_right;
+		rotate_point_right.x = cos(ellipse_angle) * x - sin(ellipse_angle) * y_right;
+		rotate_point_right.y = sin(ellipse_angle) * x + cos(ellipse_angle) * y_right;
+
+		//trans
+		rotate_point_right += center;
+
+		//store
+		ellipse_points.push_back(Point(rotate_point_right));
+	}
+
+	vector<vector<Point>> ellipses;
+	ellipses.push_back(ellipse_points);
+
+	double a0 = matchShapes(contour, ellipse_points, CV_CONTOURS_MATCH_I1, 0);
+	cout << a0 << '\n';
+	if (a0 > threshold)
+		return true;
+
+	return false;
+}
+
 void findShapes(const Mat &image, vector<vector<Point>> &detectedShapes, vector<string> &shape_names)
 {
 	/* Steps:
@@ -60,7 +125,7 @@ void findShapes(const Mat &image, vector<vector<Point>> &detectedShapes, vector<
 		vector<vector<Point>> contours;
 		vector<Vec4i> hierarchy;
 
-		findContours(detectedEdges, contours, hierarchy, RETR_LIST, CHAIN_APPROX_SIMPLE);
+		findContours(detectedEdges, contours, hierarchy, RETR_TREE, CHAIN_APPROX_SIMPLE);
 		hierarchy.clear();
 
 		vector<Point> approx;
@@ -80,7 +145,7 @@ void findShapes(const Mat &image, vector<vector<Point>> &detectedShapes, vector<
 				case 2:
 					break;
 				case 3:
-					// check if this is indeed correct
+					// TODO: check if this is indeed a triangle
 					shape_names.push_back("triangle");
 					detectedShapes.push_back(approx);
 					break;
@@ -102,16 +167,12 @@ void findShapes(const Mat &image, vector<vector<Point>> &detectedShapes, vector<
 					detectedShapes.push_back(approx);
 					break;
 				default:
-					// shape might be a circle/ellipse, or it might be a regular polygon with more sides
-					// apply hough transform to find out if its a circle or an ellipse
-					vector<Vec3f> circle;
-					HoughCircles(detectedEdges, circle, HOUGH_GRADIENT, 2, detectedEdges.rows / 4, 100, 200);
-					if (circle.size()) {
-						shape_names.push_back("circle");
-						detectedShapes.push_back(approx);
-						break;
-					}
 					// might still be an ellipse
+					if (isEllipse(contour, 0.001)) {
+						shape_names.push_back("ellipse");
+						detectedShapes.push_back(contour);
+					}
+					break;
 			}
 		}
 	}
