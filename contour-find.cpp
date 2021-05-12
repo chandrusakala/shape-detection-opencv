@@ -1,6 +1,9 @@
+#include <algorithm>
 #include <cmath>
 #include <chrono>
+#include <fstream>
 #include <iostream>
+#include <string>
 #include <vector>
 
 #include <opencv2/core.hpp>
@@ -29,7 +32,7 @@ double angle(const Point a, const Point b, const Point c)
 	return acos(cos_angle);
 }
 
-bool isEllipse(const vector<Point> &contour, double threshold)
+bool isEllipse(const vector<Point> &contour, double threshold, bool &circle)
 {
 	/*
 	 * Find the bounding rectangle
@@ -47,132 +50,139 @@ bool isEllipse(const vector<Point> &contour, double threshold)
 	double b_2 = pow(bound.size.height * 0.5, 2);
 	double ellipse_angle = (bound.angle * M_PI) / 180;
 
-	for (size_t i = 0; i < bound.size.width; i++) {
-		double x = -bound.size.width * 0.5 + i;
-		double y_left = sqrt((1 - (x * x / a_2)) * b_2);
-
-		//rotate
-		//[ cos(seta) sin(seta)]
-		//[-sin(seta) cos(seta)]
-		cv::Point2f rotate_point_left;
-		rotate_point_left.x = cos(ellipse_angle) * x - sin(ellipse_angle) * y_left;
-		rotate_point_left.y = sin(ellipse_angle) * x + cos(ellipse_angle) * y_left;
-
-		//trans
-		rotate_point_left += center;
-
-		//store
-		ellipse_points.push_back(Point(rotate_point_left));
+	size_t num_conforming_points = 0;
+	for (const Point p: contour) {
+		auto val = pow((p.x - center.x) * cos(ellipse_angle) + (p.y - center.y) * sin(ellipse_angle), 2) / a_2;
+		val += pow((p.x - center.x) * sin(ellipse_angle) - (p.y - center.y) * cos(ellipse_angle), 2) / b_2;
+		if (fabs(val - 1.0) < threshold)
+			++num_conforming_points;
 	}
 
-	for (size_t i = 0; i < bound.size.width; i++) {
-		double x = bound.size.width * 0.5 - i;
-		double y_right = -sqrt((1 - (x * x / a_2)) * b_2);
+	if (static_cast<double>(num_conforming_points) / contour.size() >= 0.5) {
+		if (fabs(bound.size.width - bound.size.height) / 2 <= 2)
+			circle = true;
+		else
+			circle = false;
 
-		//rotate
-		//[ cos(seta) sin(seta)]
-		//[-sin(seta) cos(seta)]
-		cv::Point2f rotate_point_right;
-		rotate_point_right.x = cos(ellipse_angle) * x - sin(ellipse_angle) * y_right;
-		rotate_point_right.y = sin(ellipse_angle) * x + cos(ellipse_angle) * y_right;
-
-		//trans
-		rotate_point_right += center;
-
-		//store
-		ellipse_points.push_back(Point(rotate_point_right));
-	}
-
-	vector<vector<Point>> ellipses;
-	ellipses.push_back(ellipse_points);
-
-	double a0 = matchShapes(contour, ellipse_points, CV_CONTOURS_MATCH_I1, 0);
-	cout << a0 << '\n';
-	if (a0 > threshold)
 		return true;
+	}
 
 	return false;
 }
 
-void findShapes(const Mat &image, vector<vector<Point>> &detectedShapes, vector<string> &shape_names)
+string getMemoryUsage()
+{
+	ifstream status_file("/proc/self/status");
+	string line;
+
+	while (getline(status_file, line)) {
+		size_t pos;
+		if ((pos = line.find("VmPeak:")) != string::npos)
+			return line.substr(pos + 8, line.length());
+	}
+
+	return "";
+}
+
+bool findShapeFromContour(const vector<Point> &contour, string &shapeName, vector<Point> &detectedShape)
+{
+	vector<Point> approx;
+	double max_angle = 0;
+	approxPolyDP(contour, approx, /* epsilon */ arcLength(contour, true) * 0.02, /* curve closed */ true);
+
+	// Shapes only appear with convex contours
+	// Also, ignore shapes with area < <min_area>, because anything smaller is likely just noise / not an important find
+	if (!isContourConvex(approx) || fabs(contourArea(approx)) <= 100)
+		return false;
+
+	switch (approx.size()) {
+		case 0:
+		case 1:
+		case 2:
+			break;
+		case 3:
+			// TODO: check if this is indeed a triangle
+			shapeName = "triangle";
+			detectedShape = approx;
+			return true;
+		case 4:
+			for (size_t i = 0; i < 4; ++i) {
+				// find the maximum cosine of the angle between joint edges
+				double point_angle = fabs(angle(approx[i], approx[(i + 1) % 4], approx[(i + 2) % 4]));
+				max_angle = MAX(max_angle, point_angle);
+			}
+			if (fabs(max_angle - M_PI_2) < 0.1) {
+				// All the angles are ~ pi/2, which means it is safe to assume it is a rectangle
+				shapeName = "rectangle";
+				detectedShape = approx;
+				return true;
+			}
+			return false;
+		case 5:
+			//pentagon
+			shapeName = "pentagon";
+			detectedShape = approx;
+			return true;
+		default:
+			// might still be an ellipse
+			bool circle = false;
+			if (isEllipse(contour, 0.09, circle)) {
+				if (circle)
+					shapeName = "circle";
+				else
+					shapeName = "ellipse";
+				detectedShape = contour; //approximation looks bad for ellipses
+				return true;
+			}
+			return false;
+	}
+	return false;
+}
+
+void findShapes(const Mat &image, vector<vector<Point>> &detectedShapes, vector<string> &shapeNames)
 {
 	/* Steps:
-	 * 1. Change image to greyscale
+	 * 1. Pre-process
 	 * 2. Find contours
 	 * 3. Find shapes among contours
 	 * 4. Report results
 	 */
 
-	Mat greyImage(image.size(), CV_8U), downscaled_image, upscaled_image;
+	Mat greyImage(image.size(), CV_8U), downscaledImage, upscaledImage;
 
-	// Downscale and then upscale image to clear up some noise
-	pyrDown(image, downscaled_image, Size(image.cols / 2, image.rows / 2));
-	pyrUp(downscaled_image, upscaled_image, image.size());
+	pyrDown(image, downscaledImage, Size(image.cols / 2, image.rows / 2));
+	pyrUp(downscaledImage, upscaledImage, image.size());
+	downscaledImage.release();
 
 	// go one channel at a time (RGB)
 	for (int c = 0; c < 3; ++c) {
 		int ch[] = {c, 0};
-		mixChannels(&image, 1, &greyImage, 1, ch, 1);
+		mixChannels(&upscaledImage, 1, &greyImage, 1, ch, 1);
 
-		Mat detectedEdges;
-		const int low_threshold = 0;
-		const int high_threshold = 100;
+		for (int level = 0; level < 11; ++level) {
+			Mat thresholdedImage;
+			if (level == 0) {
+				// Find the edges, then dilate them to help the contour detector
+				const int low_threshold = 10;
+				const int high_threshold = 30;
 
-		// Find the edges, then dilate them to help the contour detector
-		Canny(greyImage, detectedEdges, low_threshold, high_threshold, 5);
-		dilate(detectedEdges, detectedEdges, Mat(), Point(-1, -1));
+				Canny(greyImage, thresholdedImage, low_threshold, high_threshold, 5);
+				dilate(thresholdedImage, thresholdedImage, Mat(), Point(-1, -1));
+			} else {
+				thresholdedImage = greyImage >= (level + 1) * 255 / 10.0;
+			}
 
-		vector<vector<Point>> contours;
-		vector<Vec4i> hierarchy;
+			vector<vector<Point>> contours;
 
-		findContours(detectedEdges, contours, hierarchy, RETR_TREE, CHAIN_APPROX_SIMPLE);
-		hierarchy.clear();
+			findContours(thresholdedImage, contours, RETR_LIST, CHAIN_APPROX_SIMPLE);
 
-		vector<Point> approx;
-		double max_angle = 0;
-
-		for (auto& contour: contours) {
-			approxPolyDP(contour, approx, arcLength(contour, true) * 0.01, true);
-
-			// Shapes only appear with convex contours
-			// Also, ignore shapes with area < <min_area>, because anything smaller is likely just noise / not an important find
-			if (!isContourConvex(approx) || fabs(contourArea(approx)) <= 100)
-				continue;
-
-			switch (approx.size()) {
-				case 0:
-				case 1:
-				case 2:
-					break;
-				case 3:
-					// TODO: check if this is indeed a triangle
-					shape_names.push_back("triangle");
-					detectedShapes.push_back(approx);
-					break;
-				case 4:
-					for (size_t i = 2; i < 5; ++i) {
-						// find the maximum cosine of the angle between joint edges
-						double point_angle = fabs(angle(approx[i % 4], approx[i - 2], approx[i - 1]));
-						max_angle = MAX(max_angle, point_angle);
-					}
-					if (max_angle < M_PI_2) {
-						// All the angles are ~ pi/2, which means it is safe to assume it is a rectangle
-						shape_names.push_back("rectangle");
-						detectedShapes.push_back(approx);
-					}
-					break;
-				case 5:
-					//pentagon
-					shape_names.push_back("pentagon");
-					detectedShapes.push_back(approx);
-					break;
-				default:
-					// might still be an ellipse
-					if (isEllipse(contour, 0.001)) {
-						shape_names.push_back("ellipse");
-						detectedShapes.push_back(contour);
-					}
-					break;
+			for (auto& contour: contours) {
+				string shapeName;
+				vector<Point> shape;
+				if (findShapeFromContour(contour, shapeName, shape)) {
+					shapeNames.push_back(shapeName);
+					detectedShapes.push_back(shape);
+				}
 			}
 		}
 	}
@@ -210,6 +220,7 @@ int main(int argc, char *argv[])
 	long long time_spent = chrono::duration_cast<chrono::microseconds>(end_time - start_time).count();
 	cout << "Took " << time_spent << "us\n";
 
+	cout << "Peak memory usage: " << getMemoryUsage() << '\n';
 	imshow("Contours", image);
 	waitKey(0);
 
